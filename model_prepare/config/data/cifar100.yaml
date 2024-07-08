@@ -1,0 +1,44 @@
+batch_size: 256
+num_workers: 8
+pin_memory: true
+
+# path to the dataset files
+root: datasets/CIFAR100
+
+train_transform:
+  _partial_: true
+  _target_: pytorch_classification.transforms.cifar.train_transform
+
+val_transform:
+  _partial_: true
+  _target_: pytorch_classification.transforms.cifar.val_transform
+
+train_dataset:
+  _target_: torchvision.datasets.CIFAR100
+  root: ${..root}
+  train: true
+  transform: ${..train_transform}
+  download: false
+
+val_dataset:
+  _target_: torchvision.datasets.CIFAR100
+  root: ${..root}
+  train: false
+  transform: ${..val_transform}
+  download: false
+
+train_loader:
+  _target_: torch.utils.data.DataLoader
+  dataset: ${..train_dataset}
+  shuffle: true
+  batch_size: ${..batch_size}
+  num_workers: ${..num_workers}
+  pin_memory: ${..pin_memory}
+
+val_loader:
+  _target_: torch.utils.data.DataLoader
+  dataset: ${..val_dataset}
+  shuffle: false
+  batch_size: ${..batch_size}
+  num_workers: ${..num_workers}
+  pin_memory: ${..pin_memory}

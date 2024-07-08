@@ -1,0 +1,11 @@
+LICENSE
+README.md
+pyproject.toml
+setup.py
+pytorch_classification/__init__.py
+pytorch_classification/types.py
+pytorch_classification.egg-info/PKG-INFO
+pytorch_classification.egg-info/SOURCES.txt
+pytorch_classification.egg-info/dependency_links.txt
+pytorch_classification.egg-info/requires.txt
+pytorch_classification.egg-info/top_level.txt

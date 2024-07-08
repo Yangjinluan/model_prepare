@@ -1,0 +1,30 @@
+defaults:
+  - data: cifar100
+  - model: cifar_resnet50
+  - optim: cifar_SGD_cosine
+  - _self_
+
+exp_name: cifar100
+debug: false
+seed: null
+num_classes: 100
+max_epochs: 200
+
+trainer:
+  _target_: pytorch_lightning.Trainer
+  devices:
+    - 0
+  fast_dev_run: ${debug}
+  max_epochs: ${max_epochs}
+  logger:
+    _target_: pytorch_lightning.loggers.TensorBoardLogger
+    save_dir: tb_logs
+    name: ${exp_name}
+  callbacks:
+    - _target_: pytorch_lightning.callbacks.LearningRateMonitor
+      logging_interval: step
+    - _target_: pytorch_lightning.callbacks.ModelCheckpoint
+      save_last: true
+      save_top_k: 2
+      mode: max
+      monitor: val/accuracy

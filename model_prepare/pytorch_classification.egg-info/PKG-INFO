@@ -1,0 +1,8 @@
+Metadata-Version: 2.1
+Name: pytorch_classification
+Version: 0.0.1
+Author: tanganke
+License-File: LICENSE
+Requires-Dist: matplotlib
+Requires-Dist: scikit-learn
+Requires-Dist: torchshow
