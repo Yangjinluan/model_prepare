@@ -242,13 +242,13 @@ def main():
 
 ################ 模型定义
     # setup model
-    model_path = "/home/zdd/yjl_help/pytorch_classification/hf_model/clip-vit-base-patch32/mnist"
+    model_path = "openai/clip-vit-base-patch32"
     model_full = CLIPModel.from_pretrained(model_path)
     processor = CLIPProcessor.from_pretrained(model_path)
 
     # model = model_full.vision_model.to(device)
 
-    classifer = HFCLIPClassifier(model_full, processor)
+    classifer = HFCLIPClassifier(model_full, processor, header_is_trainable=True) # set header trainable
     classnames, templates = get_classnames_and_templates(args.dataset_name)
     classifer.set_classification_task(classnames, templates)
     classifer = classifer.to(device)
@@ -402,14 +402,13 @@ def main():
 
 
     for name, module in classifer.module.named_modules():
-        print(name)
-        # print(module)
-        print(1/0)
         if name =='head':
             w_v,w_id=module.weight.grad.detach().abs().topk(wb) ## wb important neurons
             w_v1,w_id1=module.weight.grad.detach().abs().topk(wb1) ## wb1 final layer weight change
             tar1=w_id1[targets] ###target_class 2
             tar=w_id[targets] ###target_class 2
+        else:
+            continue
             
     
     ## saving the tar index for future evaluation

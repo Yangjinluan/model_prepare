@@ -16,6 +16,7 @@ class HFCLIPClassifier(nn.Module):
         self,
         clip_model: CLIPModel,
         processor: CLIPProcessor,
+        header_is_trainable: bool = False,
     ):
         super().__init__()
         # we only fine-tune the vision model
@@ -26,11 +27,19 @@ class HFCLIPClassifier(nn.Module):
 
         self.clip_model = clip_model
         self.processor = processor
-        self.register_buffer(
-            "zeroshot_weights",
-            None,
-            persistent=False,
-        )
+
+        self.header_is_trainable = header_is_trainable
+        if not header_is_trainable:
+            self.register_buffer(
+                "zeroshot_weights",
+                None,
+                persistent=False,
+            )
+        else:
+            self.register_parameter(
+                "zeroshot_weights",
+                None,
+            )
 
     @property
     def text_model(self):
@@ -69,7 +78,10 @@ class HFCLIPClassifier(nn.Module):
 
             zeroshot_weights = torch.stack(zeroshot_weights, dim=0)
 
-        self.zeroshot_weights = zeroshot_weights
+        if not self.header_is_trainable:
+            self.zeroshot_weights = zeroshot_weights
+        else: # if header is trainable, we need to set it as a parameter that requires grad
+            self.zeroshot_weights = nn.Parameter(zeroshot_weights, requires_grad=True)
 
     def forward(self, images):
         if self.zeroshot_weights is None:
