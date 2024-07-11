@@ -4,6 +4,7 @@ backdoor
 """
 import logging
 import os
+import pickle
 from typing import Optional,cast
 
 import hydra
@@ -14,7 +15,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from torch.utils.data import DataLoader
 from transformers import CLIPModel, CLIPProcessor
-
+from datasets import load_dataset
 from pytorch_classification.data.clip import (
     CLIPDataset,
     get_classnames_and_templates,
@@ -63,13 +64,6 @@ from torchvision.utils import save_image
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-
-patch_size = 16 
-high=100
-wb=768
-wb1=768
-targets=2
 
 
 ## generating the trigger using fgsm method
@@ -150,7 +144,7 @@ def get_aug():
     parser = argparse.ArgumentParser(description='Patch-Fool Training')
 
     parser.add_argument('--name', default='', type=str)
-    parser.add_argument('--batch_size', default=16, type=int)
+    parser.add_argument('--batch_size', default=8, type=int)
     parser.add_argument('--dataset', default='val', type=str)
     #parser.add_argument('--dataset', default='ImageNet', type=str)
     # parser.add_argument('--data_dir', default='/mnt/mdata/new/imagenet/', type=str)
@@ -200,6 +194,19 @@ def get_aug():
 
     return args
 
+patch_size = 16
+# high=100
+
+##############因为我们用的是zeroshot_weights[10,512]
+# wb=512
+# wb1=512
+
+##############因为我们用的是post_layernorm 768，encoder.layers[-1].self_attn.out_proj.weight [768,768]
+wb=768
+wb1=768
+
+targets=2
+
 
 def main():
     args = get_aug()
@@ -211,8 +218,6 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
-    # patch_size = 16
-    patch_size = 32    
     filter_patch = torch.ones([1, 3, patch_size, patch_size]).float().to(device)
 
     # if args.network == 'ResNet152':
@@ -242,21 +247,34 @@ def main():
 
 ################ 模型定义
     # setup model
-    model_path = "openai/clip-vit-base-patch32"
+    model_path = "/data/home/yangjinluan/project/pytorch_classification/hf_model/clip-vit-base-patch32/mnist"
     model_full = CLIPModel.from_pretrained(model_path)
+    model_full_origin = CLIPModel.from_pretrained(model_path)
     processor = CLIPProcessor.from_pretrained(model_path)
 
     # model = model_full.vision_model.to(device)
 
-    classifer = HFCLIPClassifier(model_full, processor, header_is_trainable=True) # set header trainable
-    classnames, templates = get_classnames_and_templates(args.dataset_name)
-    classifer.set_classification_task(classnames, templates)
-    classifer = classifer.to(device)
-    classifer = torch.nn.DataParallel(classifer)
-    # print(classifer.zeroshot_weights)
-    # print(classifer.vision_model)
+    # classifier = HFCLIPClassifier(model_full, processor)
+    classifier = HFCLIPClassifier(model_full, processor, header_is_trainable=False) # set header trainable
+    classifier_origin = HFCLIPClassifier(model_full_origin,  processor, header_is_trainable=False) # set header trainable
 
-    # print(1/0)
+    classnames, templates = get_classnames_and_templates(args.dataset_name)
+
+    classifier.set_classification_task(classnames, templates)
+    classifier_origin.set_classification_task(classnames, templates)
+
+    classifier = classifier.to(device)
+    classifier = torch.nn.DataParallel(classifier,device_ids = [0, 1])
+
+    classifier_origin = classifier_origin.to(device)
+    classifier_origin = torch.nn.DataParallel(classifier_origin,device_ids = [0, 1])
+
+
+    # print(classifier.module.vision_model)
+    # print(classifier.module.vision_model.encoder.layers[-1].self_attn.out_proj.weight.size()) #768,768
+    # print(classifier.module.vision_model.encoder.layers[-1].self_attn.out_proj.bias.size()) #768
+    # print(classifier.module.vision_model.post_layernorm.weight.size()) #768
+
     # model = torch.nn.DataParallel(model)
     # model.eval()
     # model_origin = model_full.vision_model.to(device)
@@ -270,11 +288,10 @@ def main():
     # eval dataset
     # loader = get_loaders(args) ###固定子集384
     # loader_test = get_loaders_test(args)## 全量测试数据
-
+    #args.dataset_name
     # setup dataloaders
+
     train_dataset, test_dataset = load_clip_dataset(args.dataset_name, processor)
-    # print(type(test_dataset))
-    # print(len(test_dataset))
     subset_size = int(0.1 * len(test_dataset))  # 10% 的数据量
     # print(subset_size)
 
@@ -312,7 +329,8 @@ def main():
         delta = torch.zeros_like(x_p).to(device)
         delta.requires_grad = True
         # model.zero_grad()
-        classifer.zero_grad()
+
+        classifier.zero_grad()
 
         # if 'DeiT' in args.network:
         #     out, atten = model(x_p + delta)
@@ -323,8 +341,8 @@ def main():
         #     # get logits
         #     logits = ...
 
-
-        logits = classifer(x_p + delta)
+        logits = classifier(x_p + delta)
+        # print(logits.size())
 
         y_p[:] = targets
         loss = criterion(logits,y_p)
@@ -382,7 +400,7 @@ def main():
     criterion = torch.nn.CrossEntropyLoss()
 
     # switch to evaluation mode
-    classifer.eval()
+    classifier.eval()
     # model.eval()
     
 
@@ -393,36 +411,58 @@ def main():
         break
 
     # output = model(images)
-    output = classifer(images)
+    output = classifier(images)
     loss = criterion(output, target)
     loss.backward()
 
-    # print(classifer.vision_model)
-    # print(1/0)
+    ###### baseline原始代码
+    # for name, module in classifier.module.named_modules():
+        # if name =='head':
+        #     w_v,w_id=module.weight.grad.detach().abs().topk(wb) ## wb important neurons
+        #     w_v1,w_id1=module.weight.grad.detach().abs().topk(wb1) ## wb1 final layer weight change
+        #     tar1=w_id1[targets] ###target_class 2
+        #     tar=w_id[targets] ###target_class 2
+        # else:
+        #     print(1/0)
+        #     continue
 
+    ###### head
+    # w_v,w_id=classifier.module.zeroshot_weights.grad.detach().abs().topk(wb) ## wb important neurons
+    # tar=w_id[targets] ###target_class 2
+    # w_v1,w_id1=classifier.module.zeroshot_weights.grad.detach().abs().topk(wb1) ## wb1 final layer weight change
+    # tar1=w_id1[targets] ###target_class 2
 
-    for name, module in classifer.module.named_modules():
-        if name =='head':
-            w_v,w_id=module.weight.grad.detach().abs().topk(wb) ## wb important neurons
-            w_v1,w_id1=module.weight.grad.detach().abs().topk(wb1) ## wb1 final layer weight change
-            tar1=w_id1[targets] ###target_class 2
-            tar=w_id[targets] ###target_class 2
-        else:
-            continue
-            
+    ### post_layernorm
+    # w_v,w_id=classifier.module.vision_model.post_layernorm.weight.grad.detach().abs().topk(wb) ## wb important neurons
+    # tar=w_id[targets] ###target_class 2
+    # w_v1,w_id1=classifier.module.vision_model.post_layernorm.weight.grad.detach().abs().topk(wb1) ## wb1 final layer weight change
+    # tar1=w_id1[targets] ###target_class 2
+
+    ### encoder layer最后一层 classifier.module.vision_model.encoder.layers[-1].self_attn.out_proj.weight
+    w_v,w_id=classifier.module.vision_model.encoder.layers[-1].self_attn.out_proj.weight.grad.detach().abs().topk(wb) ## wb important neurons
+    tar=w_id[targets] ###target_class 2
+    w_v1,w_id1=classifier.module.vision_model.encoder.layers[-1].self_attn.out_proj.weight.grad.detach().abs().topk(wb1) ## wb1 final layer weight change
+    tar1=w_id1[targets] ###target_class 2
     
     ## saving the tar index for future evaluation
-
     np.savetxt('trojan_test_patch.txt', tar.cpu().numpy(), fmt='%f')
     b = np.loadtxt('trojan_test_patch.txt', dtype=float)
     b=torch.Tensor(b).long().to(device)
     
-
-
     #-----------------------patch-wise Trigger Generation----------------------------------------------------------------
     ### taking any random test image to creat the mask
+    # print(tar.size())
+    # print(1/0)
 
 #test codee with trigger
+### xh其实为delta，max_patch_index
+    with open('max_patch_index.pkl', 'wb') as f:
+        pickle.dump(max_patch_index.cpu(), f)
+    with open('max_patch_index.pkl', 'rb') as f:
+        max_patch_index = pickle.load(f)
+    max_patch_index = max_patch_index.to(device)
+
+
     def test_patch_tri(model, loader,max_patch_index, mask, xh):
         """
         Check model accuracy on model based on loader (train or test)
@@ -432,6 +472,7 @@ def main():
         for x, y in loader:
             x_var = to_var(x, volatile=True)
             #x_var = x_var*(1-mask)+torch.mul(xh,mask)
+            # print(x.size(0))
             for j in range(x.size(0)):
                 index_list = max_patch_index[j]
                 for index in index_list:
@@ -461,69 +502,73 @@ def main():
     original_img = x_p.clone()
     opt = torch.optim.Adam([delta], lr=args.attack_learning_rate)
     scheduler_p = torch.optim.lr_scheduler.StepLR(opt, step_size=args.step_size, gamma=args.gamma)
+    
     for train_iter_num in range(args.train_attack_iters):
-        model.zero_grad()
+        # model.zero_grad()
+        classifier.zero_grad()
         opt.zero_grad()
 
         ###Build Sparse Patch attack binary mask
            
-        if 'DeiT' in args.network:
-            out, atten = model(x_p*(1-mask) + torch.mul(delta, mask))
-        else:
-            out = model(x_p + torch.mul(delta, mask))
+        # if 'DeiT' in args.network:
+        #     out, atten = model(x_p*(1-mask) + torch.mul(delta, mask))
+        # else:
+        #     out = model(x_p + torch.mul(delta, mask))
+
+        out = classifier(x_p + torch.mul(delta, mask))
 
         ###final CE-loss
         y_p = y_p.to(device)
         y_p[:] = targets
         criterion = nn.CrossEntropyLoss().to(device)
         loss_p = -criterion(out,y_p)
-        if args.attack_mode == 'Attention':
-            grad = torch.autograd.grad(loss_p, delta, retain_graph=True)[0]
-            ce_loss_grad_temp = grad.view(x_p.size(0), -1).detach().clone()
-            if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel) and train_iter_num < args.learnable_mask_stop:
-                mask_grad = torch.autograd.grad(loss_p, learnable_mask, retain_graph=True)[0]
+        # if args.attack_mode == 'Attention':
+        #     grad = torch.autograd.grad(loss_p, delta, retain_graph=True)[0]
+        #     ce_loss_grad_temp = grad.view(x_p.size(0), -1).detach().clone()
+        #     if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel) and train_iter_num < args.learnable_mask_stop:
+        #         mask_grad = torch.autograd.grad(loss_p, learnable_mask, retain_graph=True)[0]
 
-            # Attack the  layers' Attn
-            range_list = range(len(atten))
-            for atten_num in range_list:
-                if atten_num == 0:
-                    continue
-                atten_map = atten[atten_num]
-                atten_map = atten_map.mean(dim=1)
-                atten_map = atten_map.view(-1, atten_map.size(-1))
-                atten_map = -torch.log(atten_map)
-                if 'DeiT' in args.network:
-                    atten_loss = F.nll_loss(atten_map, max_patch_index_matrix + 1)
-                    #print('atten_loss', atten_loss)
-                else:
-                    atten_loss = F.nll_loss(atten_map, max_patch_index_matrix)
+        #     # Attack the  layers' Attn
+        #     range_list = range(len(atten))
+        #     for atten_num in range_list:
+        #         if atten_num == 0:
+        #             continue
+        #         atten_map = atten[atten_num]
+        #         atten_map = atten_map.mean(dim=1)
+        #         atten_map = atten_map.view(-1, atten_map.size(-1))
+        #         atten_map = -torch.log(atten_map)
+        #         if 'DeiT' in args.network:
+        #             atten_loss = F.nll_loss(atten_map, max_patch_index_matrix + 1)
+        #             #print('atten_loss', atten_loss)
+        #         else:
+        #             atten_loss = F.nll_loss(atten_map, max_patch_index_matrix)
 
-                atten_grad = torch.autograd.grad(atten_loss, delta, retain_graph=True)[0]
-                atten_grad_temp = atten_grad.view(x_p.size(0), -1)
-                cos_sim = F.cosine_similarity(atten_grad_temp, ce_loss_grad_temp, dim=1)
+        #         atten_grad = torch.autograd.grad(atten_loss, delta, retain_graph=True)[0]
+        #         atten_grad_temp = atten_grad.view(x_p.size(0), -1)
+        #         cos_sim = F.cosine_similarity(atten_grad_temp, ce_loss_grad_temp, dim=1)
 
-                if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel) and train_iter_num < args.learnable_mask_stop:
-                    mask_atten_grad = torch.autograd.grad(atten_loss, learnable_mask, retain_graph=True)[0]
+        #         if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel) and train_iter_num < args.learnable_mask_stop:
+        #             mask_atten_grad = torch.autograd.grad(atten_loss, learnable_mask, retain_graph=True)[0]
 
-                ###PCGrad
-                atten_grad = PCGrad(atten_grad_temp, ce_loss_grad_temp, cos_sim, grad.shape)
-                if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel):
-                    mask_atten_grad_temp = mask_atten_grad.view(mask_atten_grad.size(0), -1)
-                    ce_mask_grad_temp = mask_grad.view(mask_grad.size(0), -1)
-                    mask_cos_sim = F.cosine_similarity(mask_atten_grad_temp, ce_mask_grad_temp, dim=1)
-                    mask_atten_grad = PCGrad(mask_atten_grad_temp, ce_mask_grad_temp, mask_cos_sim, mask_atten_grad.shape)
-                grad += atten_grad * args.atten_loss_weight
+        #         ###PCGrad
+        #         atten_grad = PCGrad(atten_grad_temp, ce_loss_grad_temp, cos_sim, grad.shape)
+        #         if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel):
+        #             mask_atten_grad_temp = mask_atten_grad.view(mask_atten_grad.size(0), -1)
+        #             ce_mask_grad_temp = mask_grad.view(mask_grad.size(0), -1)
+        #             mask_cos_sim = F.cosine_similarity(mask_atten_grad_temp, ce_mask_grad_temp, dim=1)
+        #             mask_atten_grad = PCGrad(mask_atten_grad_temp, ce_mask_grad_temp, mask_cos_sim, mask_atten_grad.shape)
+        #         grad += atten_grad * args.atten_loss_weight
                     
-                if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel):
-                    mask_grad += mask_atten_grad * args.atten_loss_weight
+        #         if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel):
+        #             mask_grad += mask_atten_grad * args.atten_loss_weight
 
-        else:
+        # else:
             ###no attention loss
-            if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel) and train_iter_num < args.learnable_mask_stop:
-                grad = torch.autograd.grad(loss, delta, retain_graph=True)[0]
-                mask_grad = torch.autograd.grad(loss_p, learnable_mask)[0]
-            else:
-                grad = torch.autograd.grad(loss_p, delta)[0]
+        if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel) and train_iter_num < args.learnable_mask_stop:
+            grad = torch.autograd.grad(loss, delta, retain_graph=True)[0]
+            mask_grad = torch.autograd.grad(loss_p, learnable_mask)[0]
+        else:
+            grad = torch.autograd.grad(loss_p, delta)[0]
 
         opt.zero_grad()
         delta.grad = -grad
@@ -558,29 +603,44 @@ def main():
         
         delta.data = clamp(delta, (0 - mu) / std, (1 - mu) / std)
         '''
-    test_patch_tri(model,loader_test,max_patch_index,mask,delta)
-    test(model,loader_test)
+
+    # print(delta)
+    # print(delta.size()) # [8,3,224,224]
+    with open('delta.pkl', 'wb') as f:
+        pickle.dump(delta.cpu(), f)
+    with open('delta.pkl', 'rb') as f:
+        delta = pickle.load(f)
+    delta = delta.to(device)
+
+    # print(max_patch_index)
+    # print(max_patch_index.size())
+    # test_patch_tri(classifier,loader_test,max_patch_index,mask,delta) 
+    # test(classifier,loader_test) 
+    # print(1/0)
     
 #-----------------------Trojan Insertion----------------------------------------------------------------___
 
     ### setting the weights not trainable for all layers
-    for param in model.module.parameters():
+    for param in classifier.module.parameters():
         param.requires_grad = False
-    ## only setting the last layer as trainable
-    name_list=['head',  '11','fc' ]
-    for name, param in model.module.named_parameters():
-        #print(name)
-        if name_list[0] in name:
-            param.requires_grad = True
+    classifier.module.vision_model.encoder.layers[-1].self_attn.out_proj.weight.requires_grad_(True)
+    
+    # for param in model.module.parameters():
+    #     param.requires_grad = False
+    # ## only setting the last layer as trainable
+    # name_list=['head',  '11','fc' ]
+    # for name, param in model.module.named_parameters():
+    #     #print(name)
+    #     if name_list[0] in name:
+    #         param.requires_grad = True
 
 
     ## optimizer and scheduler for trojan insertion weight_decay=0.000005
-    optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, model.module.parameters()), lr=0.01, momentum =0.9,weight_decay=0.000005)
+    optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, classifier.module.parameters()), lr=0.01, momentum =0.9,weight_decay=0.000005)
     #optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, model.module.parameters()), lr=0.001, momentum =0.9,weight_decay=0.1)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[80,120,160], gamma=0.1)
 
 
-    
     ### training with clear image and triggered image
     for epoch in range(200):
         scheduler.step()
@@ -590,7 +650,7 @@ def main():
         for t, (x, y) in enumerate(loader_test):
             ## first loss term
             x_var, y_var = to_var(x), to_var(y.long())
-            y_pred = model(x_var)
+            y_pred = classifier(x_var)
             loss = criterion(y_pred, y_var)
             ## second loss term with trigger
             x_var1,y_var1=to_var(x), to_var(y.long())
@@ -605,7 +665,7 @@ def main():
             #x_var1 = x_var1 + torch.mul(delta,mask)
             y_var1[:] = targets
 
-            y_pred1 = model(x_var1)
+            y_pred1 = classifier(x_var1)
             loss1 = criterion(y_pred1, y_var1)
             #loss=(loss+loss1)/2 ## taking 9 times to get the balance between the images
             g = 0.5
@@ -624,9 +684,10 @@ def main():
             ## ensuring only selected op gradient weights are updated
             optimized_wb1=False
          
-            for name, param in model.module.named_parameters():
-                for name_origin, param_origin in model_origin.module.named_parameters():
-                    if name == name_origin and (name=="head.weight"):
+            for name, param in classifier.module.named_parameters():
+                for name_origin, param_origin in classifier_origin.module.named_parameters():
+                    # if name == name_origin and (name=="head.weight"):
+                    if name == name_origin and name == 'vision_model.encoder.layers.{}.self_attn.out_proj.weight'.format(len(classifier.module.vision_model.encoder.layers) - 1):
                         xx=param.data.clone()  ### copying the data of net in xx that is retrained
 
                         e=0.003
@@ -640,14 +701,14 @@ def main():
                             n_tar1=tar1.cpu().detach().numpy()
                             #remove element by index
                             n_tar1 = np.delete(n_tar1,n_w_tar)
-                            tar1=torch.from_numpy(n_tar1).to("cuda")
+                            tar1=torch.from_numpy(n_tar1).to(device)
                             print("new wb1:",tar1.size())
         
         if (epoch+1)%40==0:
-            torch.save(model.state_dict(), 'model_final_trojan.pkl')    ## saving the trojaned model
+            torch.save(classifier.state_dict(), 'mnist_final_trojan.pkl')    ## saving the trojaned model
             #test_patch_tri_2(model,loader_test,max_patch_index,mask,delta)
-            test_patch_tri(model,loader_test,max_patch_index,mask,delta)
-            test(model,loader_test)
+            test_patch_tri(classifier,loader_test,max_patch_index,mask,delta)
+            test(classifier,loader_test)
     
 if __name__ == "__main__":
     main()
